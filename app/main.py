@@ -23,6 +23,7 @@ class CheckRequest(BaseModel):
     expression: str = ""
     variables: dict[str, str] = {}
     target_unit: str | None = None
+    uncertainties: dict[str, str] = {}
 
 
 class CaseRequest(BaseModel):
@@ -30,6 +31,7 @@ class CaseRequest(BaseModel):
     expression: str = ""
     variables: dict[str, str] = {}
     target_unit: str = ""
+    uncertainties: dict[str, str] = {}
 
 
 @app.get("/api/health")
@@ -39,8 +41,8 @@ def health() -> dict:
 
 @app.post("/api/check")
 def check(req: CheckRequest) -> dict:
-    """校验表达式：递归推导量纲、换算 SI、可选目标单位换算。"""
-    return analyze(req.expression, req.variables, req.target_unit)
+    """校验表达式：递归推导量纲、换算 SI、可选目标单位换算、一阶 RSS 不确定度。"""
+    return analyze(req.expression, req.variables, req.target_unit, req.uncertainties)
 
 
 @app.get("/api/units")
@@ -52,7 +54,8 @@ def get_units() -> dict:
 @app.post("/api/cases", status_code=201)
 def create_case(req: CaseRequest) -> dict:
     case_id = db.create_case(
-        req.name.strip(), req.expression, req.variables, req.target_unit.strip()
+        req.name.strip(), req.expression, req.variables, req.target_unit.strip(),
+        req.uncertainties,
     )
     return db.get_case(case_id)
 

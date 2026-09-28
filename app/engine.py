@@ -33,16 +33,20 @@ class AnalysisError:
     start: int
     end: int
     kind: str = "error"
-    source: str = "expression"  # expression / target / var:<name>
+    source: str = "expression"  # expression / target / var:<name> / uncert:<name>
+    extra: dict | None = None   # 附加字段，如扰动来源 {"perturbed": name, "direction": "+" | "-"}
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "message": self.message,
             "start": self.start,
             "end": self.end,
             "kind": self.kind,
             "source": self.source,
         }
+        if self.extra:
+            d.update(self.extra)
+        return d
 
 
 class EngineError(Exception):
@@ -388,23 +392,293 @@ class Evaluator:
 # 顶层分析入口
 # ---------------------------------------------------------------------------
 
+def parse_src(src: str) -> Node:
+    """词法 + 语法分析（不做求值），便于复用 AST 反复重算。"""
+    return Parser(tokenize(src)).parse()
+
+
 def _parse_and_eval(src: str, resolve) -> Quantity:
-    tokens = tokenize(src)
-    node = Parser(tokens).parse()
-    return Evaluator(resolve).eval(node)
+    return Evaluator(resolve).eval(parse_src(src))
+
+
+def _node_names(node: Node) -> set[str]:
+    """收集 AST 中出现的全部标识符。"""
+    names: set[str] = set()
+
+    def walk(n: Node) -> None:
+        if n.kind == "name":
+            names.add(n.name)
+        if n.left is not None:
+            walk(n.left)
+        if n.right is not None:
+            walk(n.right)
+        for a in n.args:
+            walk(a)
+
+    walk(node)
+    return names
+
+
+def _unit_only_resolver(variable_names: set[str]):
+    """仅解析内置常量与单位（不确定度表达式中不允许引用变量）。"""
+    def resolve(name: str, node: Node) -> Quantity:
+        if name in CONSTANTS:
+            value, d, _ = CONSTANTS[name]
+            return Quantity(value, d)
+        if name in UNITS:
+            d, factor, _, _ = UNITS[name]
+            return Quantity(factor, d)
+        if name in variable_names:
+            raise EngineError(
+                f"不确定度中不能引用变量「{name}」，标准不确定度必须是带单位的独立测量值",
+                node.start, node.end, "uncert_ref",
+            )
+        raise EngineError(f"未定义的单位或常量「{name}」", node.start, node.end, "undefined")
+    return resolve
+
+
+def _make_var_resolver(variables: dict[str, str], var_ast: dict[str, Node],
+                       var_qty: dict[str, Quantity], var_err: dict[str, EngineError],
+                       stack: list[str], overrides: dict[str, Quantity] | None = None,
+                       propagate_inner: bool = False):
+    """构造变量解析闭包；overrides 中的变量直接取给定 Quantity（用于扰动）。
+
+    propagate_inner=True 时（扰动重算），传播变量错误会保留内部错误的
+    kind / 片段位置 / source，便于精确定位到变量链中真正出错的表达式。
+    """
+    overrides = overrides or {}
+
+    def wrap_inner(name: str, node: Node) -> EngineError:
+        inner = var_err[name].error
+        if propagate_inner:
+            exc = EngineError(
+                f"变量「{name}」计算出错：{inner.message}",
+                inner.start, inner.end, inner.kind,
+            )
+            exc.error.source = inner.source
+            return exc
+        return EngineError(
+            f"变量「{name}」计算出错：{inner.message}",
+            node.start, node.end, "var_error",
+        )
+
+    def evaluate_variable(name: str) -> None:
+        if name in var_qty or name in var_err:
+            return
+        stack.append(name)
+        try:
+            var_qty[name] = Evaluator(resolve).eval(var_ast[name])
+        except EngineError as exc:
+            exc.error.source = f"var:{name}"
+            var_err[name] = exc
+        except OverflowError:
+            err = EngineError("数值溢出", 0, len(variables[name]), "value")
+            err.error.source = f"var:{name}"
+            var_err[name] = err
+        finally:
+            stack.pop()
+
+    def resolve(name: str, node: Node) -> Quantity:
+        if name in overrides:
+            return overrides[name]
+        if name in var_qty:
+            return var_qty[name]
+        if name in var_err:
+            raise wrap_inner(name, node)
+        if name in variables:
+            if name in stack:
+                chain = " → ".join(stack + [name])
+                raise EngineError(f"变量循环引用：{chain}", node.start, node.end, "var_cycle")
+            evaluate_variable(name)
+            if name in var_qty:
+                return var_qty[name]
+            raise wrap_inner(name, node)
+        if name in CONSTANTS:
+            value, d, _ = CONSTANTS[name]
+            return Quantity(value, d)
+        if name in UNITS:
+            d, factor, _, _ = UNITS[name]
+            return Quantity(factor, d)
+        raise EngineError(f"未定义的变量或单位「{name}」", node.start, node.end, "undefined")
+
+    return resolve, evaluate_variable
+
+
+def _perturb_error(name: str, direction: str, exc: EngineError,
+                   errors: list[AnalysisError]) -> None:
+    """记录扰动重算失败：保留原错误（量纲/定义域等）与定位，标注扰动来源后立即中止。"""
+    errors.append(AnalysisError(
+        f"对输入「{name}」做 {direction} 侧扰动重算时失败：{exc.error.message}。"
+        "不确定度分析中止，不返回合成不确定度。",
+        exc.error.start, exc.error.end, exc.error.kind,
+        source=exc.error.source,
+        extra={"perturbed": name, "direction": direction},
+    ))
+
+
+def _uncertainty_analysis(expression: str, variables: dict[str, str],
+                          var_ast: dict[str, Node], var_qty: dict[str, Quantity],
+                          uncertainties: dict[str, str], main_ast: Node,
+                          nominal: Quantity, errors: list[AnalysisError],
+                          ) -> dict | None:
+    """以各独立直接输入为扰动源，双侧中心差分求一阶灵敏度，RSS 合成标准不确定度。
+
+    任一校验或扰动重算失败，都会向 errors 追加错误并返回 None，
+    绝不返回貌似有效的不确定度数值。
+    """
+    # ---- 1. 校验每个不确定度输入 -------------------------------------------
+    sources: list[dict] = []
+    u_resolve = _unit_only_resolver(set(variables))
+    for name in sorted(uncertainties):
+        src = uncertainties[name]
+        if name not in variables:
+            errors.append(AnalysisError(
+                f"不确定度对应的变量「{name}」不存在（请先在变量列表中定义它）",
+                0, max(len(name), 1), "uncert_unknown", f"uncert:{name}",
+            ))
+            continue
+        try:
+            uq = _parse_and_eval(src, u_resolve)
+        except EngineError as exc:
+            exc.error.source = f"uncert:{name}"
+            errors.append(exc.error)
+            continue
+        except OverflowError:
+            errors.append(AnalysisError(
+                f"变量「{name}」的标准不确定度数值溢出",
+                0, len(src), "value", f"uncert:{name}",
+            ))
+            continue
+        if not math.isfinite(uq.value):
+            errors.append(AnalysisError(
+                f"变量「{name}」的标准不确定度不是有限数值",
+                0, len(src), "value", f"uncert:{name}",
+            ))
+            continue
+        if uq.value < 0:
+            errors.append(AnalysisError(
+                f"变量「{name}」的标准不确定度不能为负数（实际为 {uq.value:g}）",
+                0, len(src), "uncert_negative", f"uncert:{name}",
+            ))
+            continue
+        if name in var_qty and uq.dim != var_qty[name].dim:
+            errors.append(AnalysisError(
+                f"变量「{name}」的标准不确定度量纲为「{dim_str(uq.dim)}」，"
+                f"与该变量量纲「{dim_str(var_qty[name].dim)}」不一致",
+                0, len(src), "uncert_dim", f"uncert:{name}",
+            ))
+            continue
+        # 只有“直接输入”（定义式不引用任何用户变量）才能作为独立扰动源
+        ast = var_ast.get(name)
+        referenced = (_node_names(ast) if ast is not None else set()) & set(variables)
+        if referenced:
+            errors.append(AnalysisError(
+                f"变量「{name}」引用了其他变量（{ '、'.join(sorted(referenced)) }），"
+                "不是直接测量输入，不能单独填写标准不确定度；请为其引用的直接输入填写",
+                0, max(len(variables[name]), 1), "uncert_indirect", f"uncert:{name}",
+            ))
+            continue
+        sources.append({"name": name, "u_si": uq.value, "dim": uq.dim})
+
+    if errors:
+        return None
+
+    # ---- 2. 零标称值也要有有效步长：相对步长 + 由不确定度/量级托底 ------------
+    STEP_REL = 1e-6
+
+    def step_for(src: dict) -> float:
+        x0 = var_qty[src["name"]].value
+        scale = max(abs(x0), src["u_si"])
+        h = STEP_REL * scale
+        if not math.isfinite(h) or h <= 0.0:
+            h = STEP_REL
+        return h
+
+    # ---- 3. 逐源双侧扰动：完整变量链 + 主表达式全部重算 ----------------------
+    contributions: list[dict] = []
+    variance = 0.0
+    for src in sources:
+        name = src["name"]
+        u_si = src["u_si"]
+        x0 = var_qty[name].value
+        h = step_for(src)
+
+        def rerun(direction: str, xv: float) -> Quantity:
+            q_overrides = {name: Quantity(xv, var_qty[name].dim)}
+            qty: dict[str, Quantity] = {}
+            err_map: dict[str, EngineError] = {}
+            stk: list[str] = []
+            resolver, _ = _make_var_resolver(
+                variables, var_ast, qty, err_map, stk, q_overrides,
+                propagate_inner=True)
+            try:
+                out = Evaluator(resolver).eval(main_ast)
+            except OverflowError:
+                raise EngineError("扰动重算数值溢出",
+                                  0, len(expression), "uncert_eval") from None
+            if not math.isfinite(out.value):
+                raise EngineError("扰动重算结果不是有限数值",
+                                  0, len(expression), "uncert_eval")
+            if out.dim != nominal.dim:
+                raise EngineError(
+                    f"扰动后结果量纲变为「{dim_str(out.dim)}」，"
+                    f"与标称量纲「{dim_str(nominal.dim)}」不一致",
+                    0, len(expression), "uncert_eval")
+            return out
+
+        try:
+            qp = rerun("+", x0 + h)
+        except EngineError as exc:
+            _perturb_error(name, "+", exc, errors)
+            return None
+        try:
+            qm = rerun("-", x0 - h)
+        except EngineError as exc:
+            _perturb_error(name, "-", exc, errors)
+            return None
+
+        deriv = (qp.value - qm.value) / (2.0 * h)
+        cu = abs(deriv) * u_si
+        variance += cu * cu
+        if u_si > 0.0:
+            contributions.append({
+                "name": name,
+                "u_si": u_si,
+                "step_si": h,
+                "sensitivity": deriv,
+                "contribution_si": cu,
+            })
+
+    # ---- 4. 一阶平方和（RSS）合成 -------------------------------------------
+    uc = math.sqrt(variance)
+    return {
+        "method": "central_difference_rss",
+        "step_relative": STEP_REL,
+        "si_value": uc,
+        "si_unit": si_unit_str(nominal.dim),
+        "sources": contributions,
+        "target": None,  # 由目标单位换算阶段填充
+    }
 
 
 def analyze(expression: str, variables: dict | None = None,
-            target_unit: str | None = None) -> dict:
+            target_unit: str | None = None,
+            uncertainties: dict | None = None) -> dict:
     """分析表达式，返回可 JSON 序列化的结果字典。
 
     即使存在错误也会尽量返回已算出的部分；errors 中每项都带有
-    source（expression / target / var:<名称>）与 (start, end) 片段位置。
+    source（expression / target / var:<名称> / uncert:<名称>）与 (start, end) 片段位置。
+    uncertainties 为 {变量名: 带单位的标准不确定度}，仅可标注在直接输入变量上。
     """
     expression = expression or ""
     variables = {
         str(k).strip(): (v if isinstance(v, str) else str(v))
         for k, v in (variables or {}).items() if str(k).strip()
+    }
+    uncertainties = {
+        str(k).strip(): (v if isinstance(v, str) else str(v)).strip()
+        for k, v in (uncertainties or {}).items()
+        if str(k).strip() and (v if isinstance(v, str) else str(v)).strip()
     }
     errors: list[AnalysisError] = []
     # 变量名与内置单位/常量同名时给出非致命警告（变量优先级更高）
@@ -416,68 +690,35 @@ def analyze(expression: str, variables: dict | None = None,
         elif name in CONSTANTS:
             warnings.append({"message": f"变量「{name}」与内置常量同名，所有表达式中的 {name} 将按变量解析",
                              "name": name, "kind": "shadow_constant"})
+
+    # 预解析全部变量与主表达式（AST 可供扰动重算复用）
+    var_ast: dict[str, Node] = {}
+    for name, src in variables.items():
+        try:
+            var_ast[name] = parse_src(src)
+        except EngineError as exc:
+            exc.error.source = f"var:{name}"
+            errors.append(exc.error)
+
     var_qty: dict[str, Quantity] = {}
     var_err: dict[str, EngineError] = {}
     stack: list[str] = []
-
-    def evaluate_variable(name: str) -> None:
-        if name in var_qty or name in var_err:
-            return
-        stack.append(name)
-        try:
-            q = _parse_and_eval(variables[name], make_resolver())
-            var_qty[name] = q
-        except EngineError as exc:
-            exc.error.source = f"var:{name}"
-            var_err[name] = exc
-            errors.append(exc.error)
-        except OverflowError:
-            err = EngineError("数值溢出", 0, len(variables[name]), "value")
-            err.error.source = f"var:{name}"
-            var_err[name] = err
-            errors.append(err.error)
-        finally:
-            stack.pop()
-
-    def make_resolver():
-        def resolve(name: str, node: Node) -> Quantity:
-            if name in var_qty:
-                return var_qty[name]
-            if name in var_err:
-                raise EngineError(
-                    f"变量「{name}」计算出错：{var_err[name].error.message}",
-                    node.start, node.end, "var_error",
-                )
-            if name in variables:
-                if name in stack:
-                    chain = " → ".join(stack + [name])
-                    raise EngineError(f"变量循环引用：{chain}", node.start, node.end, "var_cycle")
-                evaluate_variable(name)
-                if name in var_qty:
-                    return var_qty[name]
-                raise EngineError(
-                    f"变量「{name}」计算出错：{var_err[name].error.message}",
-                    node.start, node.end, "var_error",
-                )
-            if name in CONSTANTS:
-                value, d, _ = CONSTANTS[name]
-                return Quantity(value, d)
-            if name in UNITS:
-                d, factor, _, _ = UNITS[name]
-                return Quantity(factor, d)
-            raise EngineError(f"未定义的变量或单位「{name}」", node.start, node.end, "undefined")
-        return resolve
+    resolver, evaluate_variable = _make_var_resolver(
+        variables, var_ast, var_qty, var_err, stack)
 
     # 先求值全部变量（即使未被引用，也能暴露变量自身的错误）
     for name in variables:
+        if name not in var_ast:
+            continue
         evaluate_variable(name)
+        if name in var_err and var_err[name].error not in errors:
+            errors.append(var_err[name].error)
 
     # 主表达式
     result: Quantity | None = None
+    main_ast: Node | None = None
     try:
-        result = _parse_and_eval(expression, make_resolver())
-        if not math.isfinite(result.value):
-            raise EngineError("计算结果不是有限数值", 0, len(expression), "value")
+        main_ast = parse_src(expression)
     except EngineError as exc:
         exc.error.source = "expression"
         errors.append(exc.error)
@@ -486,11 +727,34 @@ def analyze(expression: str, variables: dict | None = None,
         err.error.source = "expression"
         errors.append(err.error)
 
-    # 目标单位换算
+    if main_ast is not None:
+        try:
+            result = Evaluator(resolver).eval(main_ast)
+            if not math.isfinite(result.value):
+                raise EngineError("计算结果不是有限数值", 0, len(expression), "value")
+        except EngineError as exc:
+            exc.error.source = "expression"
+            errors.append(exc.error)
+            result = None
+        except OverflowError:
+            err = EngineError("数值溢出", 0, len(expression), "value")
+            err.error.source = "expression"
+            errors.append(err.error)
+            result = None
+
+    # 不确定度分析：仅在标称计算完全成功时进行；失败则追加错误且不产出数值
+    uncertainty_block = None
+    if result is not None and not any(e.source == "expression" for e in errors) \
+            and not any(e.source.startswith("var:") for e in errors) and uncertainties:
+        uncertainty_block = _uncertainty_analysis(
+            expression, variables, var_ast, var_qty, uncertainties,
+            main_ast, result, errors)
+
+    # 目标单位换算（标称值与不确定度一起换算）
     target = None
     if target_unit and target_unit.strip():
         try:
-            tq = _parse_and_eval(target_unit.strip(), make_resolver())
+            tq = _parse_and_eval(target_unit.strip(), resolver)
             if tq.value == 0:
                 raise EngineError("目标单位不能为零", 0, len(target_unit), "value")
             if result is not None:
@@ -500,6 +764,11 @@ def analyze(expression: str, variables: dict | None = None,
                         0, len(target_unit), "target_dim",
                     )
                 target = {"unit": target_unit.strip(), "value": result.value / tq.value}
+                if uncertainty_block is not None:
+                    uncertainty_block["target"] = {
+                        "unit": target_unit.strip(),
+                        "value": uncertainty_block["si_value"] / tq.value,
+                    }
         except EngineError as exc:
             exc.error.source = "target"
             errors.append(exc.error)
@@ -519,5 +788,6 @@ def analyze(expression: str, variables: dict | None = None,
             "si_unit": si_unit_str(result.dim),
             "derived": derived_matches(result.dim),
             "target": target,
+            "uncertainty": uncertainty_block,
         }
     return response

@@ -29,15 +29,20 @@ def _get() -> sqlite3.Connection:
         _conn.execute(
             """
             CREATE TABLE IF NOT EXISTS cases (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                name        TEXT NOT NULL,
-                expression  TEXT NOT NULL DEFAULT '',
-                variables   TEXT NOT NULL DEFAULT '{}',
-                target_unit TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                name           TEXT NOT NULL,
+                expression     TEXT NOT NULL DEFAULT '',
+                variables      TEXT NOT NULL DEFAULT '{}',
+                uncertainties TEXT NOT NULL DEFAULT '{}',
+                target_unit    TEXT NOT NULL DEFAULT '',
+                created_at     TEXT NOT NULL
             )
             """
         )
+        # 兼容旧库：补齐不确定度列
+        cols = {r[1] for r in _conn.execute("PRAGMA table_info(cases)").fetchall()}
+        if "uncertainties" not in cols:
+            _conn.execute("ALTER TABLE cases ADD COLUMN uncertainties TEXT NOT NULL DEFAULT '{}'")
         _conn.commit()
     return _conn
 
@@ -48,21 +53,24 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         "name": row["name"],
         "expression": row["expression"],
         "variables": json.loads(row["variables"] or "{}"),
+        "uncertainties": json.loads(row["uncertainties"] or "{}"),
         "target_unit": row["target_unit"],
         "created_at": row["created_at"],
     }
 
 
-def create_case(name: str, expression: str, variables: dict, target_unit: str) -> int:
+def create_case(name: str, expression: str, variables: dict, target_unit: str,
+                uncertainties: dict | None = None) -> int:
     with _lock:
         conn = _get()
         cur = conn.execute(
-            "INSERT INTO cases (name, expression, variables, target_unit, created_at)"
-            " VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO cases (name, expression, variables, uncertainties, target_unit, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
             (
                 name,
                 expression,
                 json.dumps(variables, ensure_ascii=False),
+                json.dumps(uncertainties or {}, ensure_ascii=False),
                 target_unit,
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
             ),

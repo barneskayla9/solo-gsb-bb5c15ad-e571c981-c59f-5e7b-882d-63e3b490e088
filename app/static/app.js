@@ -50,13 +50,15 @@ function download(filename, text) {
 
 /* ---------------- 变量编辑 ---------------- */
 
-function addVarRow(name = "", expr = "") {
+function addVarRow(name = "", expr = "", uncert = "") {
   const row = document.createElement("div");
   row.className = "var-row";
   row.innerHTML =
     `<input class="mono vname" placeholder="名称" value="${escapeHtml(name)}" spellcheck="false">` +
     `<span class="eq">=</span>` +
     `<input class="mono vexpr" placeholder="取值表达式，如 3 m/s" value="${escapeHtml(expr)}" spellcheck="false">` +
+    `<span class="eq ulabel" title="标准不确定度（带与变量一致的单位）">u</span>` +
+    `<input class="mono vuncert" placeholder="标准不确定度，如 0.1 m/s（可选）" value="${escapeHtml(uncert)}" spellcheck="false">` +
     `<button class="btn small danger vdel" title="删除该变量">✕</button>`;
   row.querySelector(".vdel").addEventListener("click", () => row.remove());
   varsEl.appendChild(row);
@@ -72,13 +74,33 @@ function collectVariables() {
   return vars;
 }
 
+function collectUncertainties() {
+  const uncert = {};
+  varsEl.querySelectorAll(".var-row").forEach((row) => {
+    const name = row.querySelector(".vname").value.trim();
+    const val = row.querySelector(".vuncert").value.trim();
+    if (name && val) uncert[name] = val;
+  });
+  return uncert;
+}
+
+function markUncertaintyInputs(errorSources) {
+  varsEl.querySelectorAll(".var-row").forEach((row) => {
+    const name = row.querySelector(".vname").value.trim();
+    row.querySelector(".vuncert").classList.toggle(
+      "input-bad", Boolean(name) && errorSources.has(`uncert:${name}`));
+  });
+}
+
 /* ---------------- 校验与渲染 ---------------- */
 
 async function runCheck() {
+  markUncertaintyInputs(new Set());  // 清除上一次的输入框标红
   const body = {
     expression: exprEl.value,
     variables: collectVariables(),
     target_unit: targetEl.value || null,
+    uncertainties: collectUncertainties(),
   };
   let res;
   try {
@@ -98,6 +120,10 @@ function sourceOf(err, body) {
   if (err.source && err.source.startsWith("var:")) {
     const name = err.source.slice(4);
     return [`变量 ${name}`, (body.variables || {})[name] ?? ""];
+  }
+  if (err.source && err.source.startsWith("uncert:")) {
+    const name = err.source.slice(7);
+    return [`不确定度 ${name}`, (body.uncertainties || {})[name] ?? ""];
   }
   return [err.source, ""];
 }
@@ -127,9 +153,15 @@ function renderResult(res, body) {
     parts.push(`<div class="status warn">⚠ ${escapeHtml(w.message)}</div>`);
   }
 
+  markUncertaintyInputs(new Set(errors.map((e) => e.source)));
+
   for (const err of errors) {
     const [label, text] = sourceOf(err, body);
     const frag = text.slice(err.start, err.end);
+    const perturbNote = err.perturbed
+      ? `<div class="muted small-text">扰动来源：变量 <code>${escapeHtml(err.perturbed)}</code>` +
+        `（${err.direction === "+" ? "正" : "负"}向扰动步长重算）</div>`
+      : "";
     parts.push(`
       <div class="error-item">
         <div class="error-head">
@@ -139,6 +171,7 @@ function renderResult(res, body) {
         </div>
         <div class="code">${fragmentHtml(text, err.start, err.end)}</div>
         ${frag ? `<div class="muted small-text">出错片段：<code>${escapeHtml(frag)}</code>（位置 ${err.start}–${err.end}）</div>` : ""}
+        ${perturbNote}
       </div>`);
   }
 
@@ -151,17 +184,75 @@ function renderResult(res, body) {
     const derived = r.derived.length
       ? r.derived.map((d) => `<span class="chip">${escapeHtml(d)}</span>`).join(" ")
       : '<span class="muted">无</span>';
-    const targetRow = r.target
-      ? `<tr><th>换算结果</th><td class="mono strong">${fmt(r.target.value)} ${escapeHtml(r.target.unit)}</td></tr>`
+
+    const uc = r.uncertainty;
+    const hasUc = Boolean(uc);
+    const spanAttr = hasUc ? "" : ' colspan="2"';
+    const headNominal = hasUc
+      ? `<tr><th></th><th>标称值</th><th>标准不确定度 u</th></tr>` : "";
+    const siUcCell = hasUc
+      ? `<td class="mono uc">± ${fmt(uc.si_value)} ${escapeHtml(uc.si_unit)}</td>` : "";
+    const targetUcCell = hasUc
+      ? `<td class="mono uc">${uc.target ? `± ${fmt(uc.target.value)} ${escapeHtml(uc.target.unit)}` : '<span class="muted">—</span>'}</td>`
       : "";
+    const targetRow = r.target
+      ? `<tr><th>换算结果</th><td class="mono strong">${fmt(r.target.value)} ${escapeHtml(r.target.unit)}</td>${targetUcCell}</tr>`
+      : "";
+
+    let ucSection = "";
+    if (hasUc) {
+      const ucStatus = uc.sources.length
+        ? `<div class="status uc-ok">∑ 合成标准不确定度（一阶 RSS，中心差分，相对步长 ${fmt(uc.step_relative)}）</div>`
+        : `<div class="status uc-ok">已填写的标准不确定度均为 0，合成标准不确定度为 0</div>`;
+      let srcRows = "";
+      const totalSq = uc.sources.reduce((a, s) => a + s.contribution_si ** 2, 0);
+      for (const s of uc.sources) {
+        const pct = totalSq > 0 ? 100 * (s.contribution_si ** 2) / totalSq : 0;
+        srcRows +=
+          `<tr>` +
+          `<td class="mono">${escapeHtml(s.name)}</td>` +
+          `<td class="mono">± ${fmt(s.u_si)}</td>` +
+          `<td class="mono muted">${fmt(s.sensitivity)}</td>` +
+          `<td class="mono">± ${fmt(s.contribution_si)}</td>` +
+          `<td class="mono muted">${fmt(pct)}%</td>` +
+          `<td class="mono muted">${fmt(s.step_si)}</td>` +
+          `</tr>`;
+      }
+      ucSection = `
+        ${ucStatus}
+        ${uc.sources.length ? `
+        <details class="uc-details">
+          <summary>各独立输入贡献（${uc.sources.length} 个扰动源）</summary>
+          <table class="uc-table">
+            <thead><tr>
+              <th>输入</th><th>u（SI 单位）</th><th>灵敏度 ∂f/∂x</th>
+              <th>贡献 |∂f/∂x|·u</th><th>方差占比</th><th>实际步长 h（SI）</th>
+            </tr></thead>
+            <tbody>${srcRows}</tbody>
+          </table>
+        </details>` : ""}
+        <p class="muted small-text">
+          合成方法：u<sub>c</sub>(y) = √(Σ(∂f/∂x<sub>i</sub>·u(x<sub>i</sub>))²)，
+          各输入视为相互独立；灵敏度由双侧中心差分
+          (f(x+h)−f(x−h))/(2h) 数值估计，对完整变量链与主表达式整体重算。
+        </p>`;
+    } else if (errors.some((e) => e.source && e.source.startsWith("uncert:")) ||
+               errors.some((e) => e.perturbed)) {
+      ucSection = `<div class="status bad">测量不确定度分析未完成：见上方错误，未给出合成不确定度。</div>`;
+    } else {
+      ucSection = `<p class="muted small-text">未填写标准不确定度：在变量行的「u」列填写带单位的标准不确定度即可启用 RSS 合成分析。</p>`;
+    }
+
     parts.push(`
-      <table class="result-table">
-        <tr><th>量纲</th><td class="mono strong">${escapeHtml(r.dimension_str)}</td></tr>
-        <tr><th>量纲向量</th><td class="mono">${escapeHtml(vec)}</td></tr>
-        <tr><th>SI 数值</th><td class="mono strong">${fmt(r.si_value)} ${escapeHtml(r.si_unit)}</td></tr>
-        <tr><th>等价单位</th><td>${derived}</td></tr>
+      <table class="result-table${hasUc ? " has-uc" : ""}">
+        ${headNominal}
+        <tr><th>量纲</th><td ${spanAttr} class="mono strong">${escapeHtml(r.dimension_str)}</td>${hasUc ? "<td></td>" : ""}</tr>
+        <tr><th>量纲向量</th><td ${spanAttr} class="mono">${escapeHtml(vec)}</td>${hasUc ? "<td></td>" : ""}</tr>
+        <tr><th>SI 数值</th><td class="mono strong">${fmt(r.si_value)} ${escapeHtml(r.si_unit)}</td>${siUcCell}</tr>
+        <tr><th>等价单位</th><td ${spanAttr}>${derived}</td>${hasUc ? "<td></td>" : ""}</tr>
         ${targetRow}
-      </table>`);
+      </table>
+      <div class="uc-section">${ucSection}</div>`);
   }
 
   resultEl.innerHTML = parts.join("");
@@ -207,9 +298,10 @@ async function loadCase(id) {
   $("#caseName").value = c.name;
   varsEl.innerHTML = "";
   const vars = c.variables || {};
+  const uncert = c.uncertainties || {};
   const names = Object.keys(vars);
   if (names.length === 0) addVarRow();
-  else names.forEach((n) => addVarRow(n, vars[n]));
+  else names.forEach((n) => addVarRow(n, vars[n], uncert[n] || ""));
   runCheck();
 }
 
@@ -223,6 +315,7 @@ async function saveCase() {
         name,
         expression: exprEl.value,
         variables: collectVariables(),
+        uncertainties: collectUncertainties(),
         target_unit: targetEl.value,
       }),
     });
@@ -281,9 +374,9 @@ $("#sample").addEventListener("click", () => {
   exprEl.value = "0.5*mass*v^2 + mass*g0*h0";
   targetEl.value = "kJ";
   varsEl.innerHTML = "";
-  addVarRow("mass", "2 kg");
-  addVarRow("v", "10 m/s");
-  addVarRow("h0", "5 m");
+  addVarRow("mass", "2 kg", "0.01 kg");
+  addVarRow("v", "10 m/s", "0.1 m/s");
+  addVarRow("h0", "5 m", "0.02 m");
   $("#caseName").value = "动能 + 重力势能";
   runCheck();
 });

@@ -23,6 +23,10 @@
           <h3>变量</h3>
           <button id="addVar" class="btn small">＋ 添加变量</button>
         </div>
+        <p class="muted small-text hint">
+          可选填写「u」列：直接测量输入（不引用其他变量）的<strong>标准不确定度</strong>，须带与该变量一致的单位，如 <code>0.01 kg</code>。
+          系统将以各独立输入为扰动源做双侧小步长重算，按一阶平方和（RSS）给出结果的合成标准不确定度。
+        </p>
         <div id="vars"></div>
 
         <label class="lbl" for="target">目标单位（可选，用于换算结果）</label>

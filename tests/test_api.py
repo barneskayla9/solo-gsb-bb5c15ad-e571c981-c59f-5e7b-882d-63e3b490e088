@@ -2,6 +2,8 @@
 import os
 import tempfile
 
+import pytest
+
 os.environ["DB_PATH"] = os.path.join(tempfile.mkdtemp(prefix="dimcheck-test-"), "test.db")
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -103,3 +105,53 @@ def test_cases_crud_and_export():
 def test_case_not_found():
     assert client.get("/api/cases/99999").status_code == 404
     assert client.delete("/api/cases/99999").status_code == 404
+
+
+def test_check_with_uncertainties_and_target():
+    r = client.post("/api/check", json={
+        "expression": "0.5*mass*v^2",
+        "variables": {"mass": "2 kg", "v": "10 m/s"},
+        "uncertainties": {"mass": "0.01 kg", "v": "0.1 m/s"},
+        "target_unit": "J",
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    u = data["result"]["uncertainty"]
+    # dE/dm = 50 → 0.5 J；dE/dv = 20 → 2 J；RSS = sqrt(4.25)
+    assert u["si_value"] == pytest.approx((0.5 ** 2 + 2 ** 2) ** 0.5)
+    assert u["target"]["unit"] == "J"
+    assert u["target"]["value"] == pytest.approx(u["si_value"])
+    assert {s["name"] for s in u["sources"]} == {"mass", "v"}
+
+
+def test_check_uncertainty_validation_error():
+    r = client.post("/api/check", json={
+        "expression": "x",
+        "variables": {"x": "1 m"},
+        "uncertainties": {"x": "-1 m"},
+    })
+    data = r.json()
+    assert data["ok"] is False
+    assert data["errors"][0]["kind"] == "uncert_negative"
+    assert data["errors"][0]["source"] == "uncert:x"
+    # 标称值照常返回，但没有不确定度块
+    assert data["result"]["si_value"] == 1.0
+    assert data["result"]["uncertainty"] is None
+
+
+def test_case_persists_uncertainties():
+    r = client.post("/api/cases", json={
+        "name": "不确定度案例",
+        "expression": "0.5*mass*v^2",
+        "variables": {"mass": "2 kg", "v": "10 m/s"},
+        "uncertainties": {"mass": "0.01 kg", "v": "0.1 m/s"},
+        "target_unit": "J",
+    })
+    assert r.status_code == 201
+    cid = r.json()["id"]
+    got = client.get(f"/api/cases/{cid}").json()
+    assert got["uncertainties"] == {"mass": "0.01 kg", "v": "0.1 m/s"}
+    assert any(c.get("uncertainties") == {"mass": "0.01 kg", "v": "0.1 m/s"}
+               for c in client.get("/api/cases").json()["cases"])
+    client.delete(f"/api/cases/{cid}")
