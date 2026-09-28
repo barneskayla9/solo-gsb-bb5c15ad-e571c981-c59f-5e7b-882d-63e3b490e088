@@ -9,7 +9,7 @@
 <body>
   <header>
     <h1>⚗️ 科研配方量纲校验台</h1>
-    <p>录入带单位的计算表达式与变量，递归推导量纲、自动换算单位，并精确定位表达式中的错误片段。</p>
+    <p>录入带单位的计算表达式与变量，递归推导量纲、自动换算单位，并精确定位表达式中的错误片段；可为直接测量的变量填写带单位的<b>标准不确定度</b>，系统经双侧小步长扰动按一阶平方和给出结果的合成标准不确定度。</p>
   </header>
 
   <main>
@@ -22,6 +22,12 @@
         <div class="row-between">
           <h3>变量</h3>
           <button id="addVar" class="btn small">＋ 添加变量</button>
+        </div>
+        <div class="var-head muted">
+          <span>名称</span><span></span><span title="变量取值，本身也是带单位表达式，可相互引用">取值表达式（带单位）</span>
+          <span></span>
+          <span title="该直接测量量的标准不确定度 u（标准差含义，须与取值同量纲）">标准不确定度 u（可留空）</span>
+          <span></span>
         </div>
         <div id="vars"></div>
 

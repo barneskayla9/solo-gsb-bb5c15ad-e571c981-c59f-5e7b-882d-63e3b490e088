@@ -6,7 +6,8 @@ services:
     image: dimcheck:latest
     container_name: dimcheck-web
     ports:
-      - "8000:8000"          # 固定端口：Web 界面与 API 均在 8000
+      # 宿主机端口可用 APP_PORT 覆盖（默认 8000）；容器内 Web 界面与 API 均在 8000
+      - "${APP_PORT:-8000}:8000"
     environment:
       DB_PATH: /app/data/app.db
     volumes:

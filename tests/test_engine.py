@@ -3,18 +3,18 @@ import math
 
 import pytest
 
-from app.engine import analyze
+from app.engine import analyze, UNCERTAINTY_STEP
 
 
-def ok(expr, variables=None, target=None):
-    res = analyze(expr, variables or {}, target)
+def ok(expr, variables=None, target=None, uncertainties=None):
+    res = analyze(expr, variables or {}, target, uncertainties)
     assert res["ok"], res["errors"]
     assert res["result"] is not None
     return res["result"]
 
 
-def fail(expr, variables=None, target=None):
-    res = analyze(expr, variables or {}, target)
+def fail(expr, variables=None, target=None, uncertainties=None):
+    res = analyze(expr, variables or {}, target, uncertainties)
     assert not res["ok"]
     assert res["errors"], "应当返回错误"
     return res["errors"]
@@ -234,3 +234,174 @@ def test_variable_shadows_unit_with_warning():
 def test_fractional_dimension_via_sqrt():
     r = ok("sqrt(2 m)")
     assert r["dimension"] == ["1/2", "0", "0", "0", "0", "0", "0"]
+
+
+# ---------------- 测量不确定度传播 ----------------
+
+VARS = {"mass": "2 kg", "v": "10 m/s", "h0": "5 m"}
+UNCS = {"mass": "0.01 kg", "v": "0.2 m/s", "h0": "0.05 m"}
+
+
+def test_uncertainty_rss_sum_of_squares():
+    # E = 0.5 m v^2 + m g0 h0
+    # dE/dm = 0.5v^2 + g0 h0 = 99.03325 ; dE/dv = m v = 20 ; dE/dh = m g0 = 19.6133
+    r = ok("0.5*mass*v^2 + mass*g0*h0", VARS, uncertainties=UNCS)
+    u = r["uncertainty"]
+    expected = math.sqrt((99.03325 * 0.01) ** 2 + (20 * 0.2) ** 2 + (19.6133 * 0.05) ** 2)
+    assert u["si_value"] == pytest.approx(expected, rel=1e-8)
+    assert u["si_unit"] == r["si_unit"]
+    assert u["relative"] == pytest.approx(expected / r["si_value"])
+    assert u["step_factor"] == UNCERTAINTY_STEP
+    by_name = {s["name"]: s for s in u["sources"]}
+    assert by_name["v"]["contribution_si"] == pytest.approx(4.0, rel=1e-8)
+    assert by_name["mass"]["contribution_si"] == pytest.approx(0.9903325, rel=1e-8)
+    # 平方和占比
+    assert by_name["v"]["contribution_si"] <= u["si_value"]
+
+
+def test_uncertainty_zero_nominal_uses_valid_step():
+    # 标称值为 0 时必须以不确定度为尺度取有效步长，不能得到 0
+    r = ok("a + b", {"a": "0 m", "b": "3 m"}, uncertainties={"a": "1 mm", "b": "0 m"})
+    u = r["uncertainty"]
+    assert u["si_value"] == pytest.approx(0.001, abs=1e-10)
+    assert [s["name"] for s in u["sources"]] == ["a"]  # 零不确定度不构成扰动源
+    assert u["sources"][0]["step_si"] > 0
+
+
+def test_uncertainty_nominal_zero_gives_null_relative():
+    r = ok("x", {"x": "0 m"}, uncertainties={"x": "0.1 m"})
+    assert r["uncertainty"]["relative"] is None
+    assert r["uncertainty"]["si_value"] == pytest.approx(0.1, abs=1e-12)
+
+
+def test_uncertainty_absent_without_inputs():
+    r = ok("1 m + 2 m")
+    assert "uncertainty" not in r
+    # 全部填零：有块可算、数值为零、无扰动源
+    r = ok("x", {"x": "5 m"}, uncertainties={"x": "0 m"})
+    assert r["uncertainty"]["si_value"] == 0
+    assert r["uncertainty"]["sources"] == []
+
+
+def test_uncertainty_propagates_through_variable_chain():
+    variables = {"mass": "80 kg", "F": "mass * g0", "A": "0.05 m^2"}
+    r = ok("F / A", variables, uncertainties={"mass": "0.5 kg"})
+    u = r["uncertainty"]
+    # u(F) = 0.5 * g0；u(P) = u(F) / A
+    assert u["si_value"] == pytest.approx(0.5 * 9.80665 / 0.05, rel=1e-8)
+    by_name = {v["name"]: v for v in u["variables"]}
+    assert by_name["F"]["uncertainty_si"] == pytest.approx(0.5 * 9.80665, rel=1e-8)
+    assert by_name["mass"]["uncertainty_si"] == pytest.approx(0.5)
+    assert by_name["A"]["uncertainty_si"] == 0.0
+
+
+def test_uncertainty_converts_with_target_unit():
+    r = ok("0.5*mass*v^2", {"mass": "2 kg", "v": "10 m/s"}, "kJ",
+           uncertainties={"v": "1 m/s"})
+    assert r["uncertainty"]["si_value"] == pytest.approx(20.0)
+    assert r["target"]["uncertainty"] == pytest.approx(0.02)
+    assert r["target"]["value"] == pytest.approx(0.1)
+
+
+def test_uncertainty_chain_sources_and_unused_variables():
+    r = ok("2*a", {"a": "3 m", "unused": "1 m"},
+           uncertainties={"a": "0.1 m", "unused": "0.5 m"})
+    assert r["uncertainty"]["si_value"] == pytest.approx(0.2, abs=1e-10)
+    assert [v["name"] for v in r["uncertainty"]["variables"]] == ["a", "unused"]
+
+
+def test_uncertainty_functions_and_powers():
+    r = ok("sin(theta)", {"theta": "pi/3"}, uncertainties={"theta": "0.01"})
+    assert r["uncertainty"]["si_value"] == pytest.approx(0.01 * 0.5, abs=1e-9)
+    r = ok("x^3", {"x": "2 m"}, uncertainties={"x": "1 mm"})
+    assert r["uncertainty"]["si_value"] == pytest.approx(12e-3, rel=1e-8)
+    r = ok("sqrt(x)", {"x": "4 m^2"}, uncertainties={"x": "0.01 m^2"})
+    assert r["uncertainty"]["si_value"] == pytest.approx(0.0025, rel=1e-8)
+
+
+def test_uncertainty_accepts_unit_expression():
+    r = ok("x", {"x": "10 m"}, uncertainties={"x": "2 cm + 3 mm"})
+    assert r["uncertainty"]["si_value"] == pytest.approx(0.023, abs=1e-11)
+
+
+def test_uncertainty_large_nominal_small_uncertainty():
+    # 步长不得因相对值过小而失效
+    r = ok("x", {"x": "1.23456789e12 m"}, uncertainties={"x": "1 um"})
+    assert r["uncertainty"]["si_value"] == pytest.approx(1e-6, abs=1e-12)
+
+
+def test_uncertainty_dimension_mismatch_rejected():
+    errs = fail("x", {"x": "5 m"}, uncertainties={"x": "2 s"})
+    e = errs[0]
+    assert e["kind"] == "uncertainty_dim"
+    assert e["source"] == "unc:x"
+
+
+def test_uncertainty_negative_rejected():
+    errs = fail("x", {"x": "5 m"}, uncertainties={"x": "-1 m"})
+    assert errs[0]["kind"] == "uncertainty_value"
+    assert errs[0]["source"] == "unc:x"
+
+
+def test_uncertainty_for_unknown_variable_rejected():
+    errs = fail("x", {"x": "5 m"}, uncertainties={"y": "1 m"})
+    assert errs[0]["kind"] == "uncertainty_unknown"
+    assert errs[0]["source"] == "unc:y"
+
+
+def test_uncertainty_bad_syntax_points_to_uncertainty():
+    errs = fail("x", {"x": "5 m"}, uncertainties={"x": "2 +"})
+    assert errs[0]["source"] == "unc:x"
+    errs = fail("x", {"x": "5 m"}, uncertainties={"x": "1 foo"})
+    assert errs[0]["source"] == "unc:x"
+    assert errs[0]["kind"] == "undefined"
+
+
+def test_uncertainty_not_summarized_when_perturbation_leaves_domain():
+    # sqrt(0)：负方向取到负数，应指出对应输入并停止汇总
+    errs = fail("sqrt(a)", {"a": "0 m^2"}, uncertainties={"a": "1 m^2"})
+    e = errs[0]
+    assert e["kind"] == "uncertainty_eval"
+    assert e["source"] == "unc:a"
+    assert "sqrt" in e["message"]
+    # 单侧越界也要停止：asin(1) 正方向 > 1
+    errs = fail("asin(x)", {"x": "1"}, uncertainties={"x": "0.01"})
+    assert errs[0]["kind"] == "uncertainty_eval"
+
+
+def test_uncertainty_failure_inside_variable_chain_reports_root_cause():
+    # 链上节点 sqrt(a*b) 在 a 负偏移时越界
+    errs = fail("sqrt(p)", {"a": "0 m", "b": "3 m", "p": "a*b"},
+                uncertainties={"a": "1 m", "b": "0.1 m"})
+    assert errs[0]["kind"] == "uncertainty_eval"
+    assert errs[0]["source"] == "unc:a"
+    assert "sqrt" in errs[0]["message"]
+
+
+def test_uncertainty_not_summarized_when_nominal_invalid():
+    res = analyze("x + 1 s", {"x": "1 m"}, uncertainties={"x": "0.1 m"})
+    assert not res["ok"]
+    assert res["result"] is None  # 不能返回貌似有效的数值
+
+
+def test_uncertainty_skipped_when_variable_chain_broken():
+    errs = fail("a", {"a": "zz"}, uncertainties={"a": "1 m"})
+    assert any(e["source"] == "var:a" for e in errs)
+    assert all(e["kind"] != "uncertainty_dim" for e in errs)
+
+
+def test_uncertainty_independent_input_warning():
+    res = analyze("F", {"mass": "80 kg", "F": "mass*g0"},
+                  uncertainties={"F": "1 N"})
+    assert res["ok"]
+    assert any(w["kind"] == "uncertainty_independent" and w["name"] == "F"
+               for w in res["warnings"])
+    # 作为独立扰动源，贡献就是 1 N
+    assert res["result"]["uncertainty"]["si_value"] == pytest.approx(1.0)
+
+
+def test_uncertainty_target_dim_mismatch_keeps_si_uncertainty():
+    res = analyze("x", {"x": "5 m"}, "kg", uncertainties={"x": "0.1 m"})
+    assert not res["ok"]
+    assert res["result"]["target"] is None
+    assert res["result"]["uncertainty"]["si_value"] == pytest.approx(0.1)

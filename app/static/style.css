@@ -76,15 +76,43 @@ input.big { font-size: 17px; padding: 12px 14px; }
   margin: 14px 0 8px;
 }
 
+.var-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  margin: 0 0 6px;
+}
+.var-head span:nth-child(1) { width: 100px; flex: none; }   /* 名称 */
+.var-head span:nth-child(2) { width: 12px; flex: none; }    /* =  */
+.var-head span:nth-child(3) { flex: 1; }                    /* 取值表达式 */
+.var-head span:nth-child(4) { width: 14px; flex: none; }    /* u  */
+.var-head span:nth-child(5) { flex: 1; }                    /* 不确定度 */
+.var-head span:nth-child(6) { width: 28px; flex: none; }    /* 删除 */
+
 .var-row {
   display: flex;
   gap: 8px;
   align-items: center;
   margin-bottom: 8px;
 }
-.var-row .vname { width: 110px; flex: none; }
+.var-row .vname { width: 100px; flex: none; }
 .var-row .vexpr { flex: 1; }
+.var-row .vunc { flex: 1; }
 .var-row .eq { color: var(--muted); }
+.var-row .u-label {
+  flex: none;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-style: italic;
+  font-size: 15px;
+  color: var(--mark);
+}
+@media (max-width: 560px) {
+  .var-row { flex-wrap: wrap; }
+  .var-row .vexpr, .var-row .vunc { flex: 1 1 100%; }
+}
+
+.unc-val { color: var(--mark); }
 
 .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
 .save-row input { flex: 1; }
@@ -175,6 +203,21 @@ input.big { font-size: 17px; padding: 12px 14px; }
   font-size: 13px;
   font-family: "JetBrains Mono", Consolas, monospace;
 }
+
+.unc-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 6px;
+  font-size: 12.5px;
+}
+.unc-table th, .unc-table td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.unc-table thead th { color: var(--muted); font-weight: 500; }
+.unc-table td:first-child { font-weight: 600; color: var(--accent); }
 
 .case-list { list-style: none; margin: 0; padding: 0; }
 .case-list li {
